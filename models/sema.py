@@ -9,7 +9,7 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader
 
 from backbone.sema_components import Adapter
-from hpo_utils_smac import hpo4adapter
+from hpo4adapter import hpo4adapter
 from utils.inc_net import SEMAVitNet
 from models.base import BaseLearner
 from utils.toolkit import tensor2numpy
