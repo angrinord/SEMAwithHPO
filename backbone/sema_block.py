@@ -5,18 +5,18 @@ import copy
 import logging
 from backbone.sema_components import Adapter, AE, Records
 
-device = 'cuda' if torch.cuda.is_available() else 'cpu' 
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 
-class AdapterModule(nn.Module):    
+class AdapterModule(nn.Module):
     def __init__(self, config, adapter_id, writer):
         super().__init__()
         self.config = config
         self.functional = Adapter(self.config, adapter_id, dropout=0.1, bottleneck=self.config.ffn_num,
-                                init_option=self.config.ffn_adapter_init_option,
-                                adapter_scalar=self.config.ffn_adapter_scalar,
-                                adapter_layernorm_option=self.config.ffn_adapter_layernorm_option,
-                                )
+                                  init_option=self.config.ffn_adapter_init_option,
+                                  adapter_scalar=self.config.ffn_adapter_scalar,
+                                  adapter_layernorm_option=self.config.ffn_adapter_layernorm_option,
+                                  )
         layer_id = int(adapter_id.split('.')[0])
         self.not_addition_layer = layer_id < config.adapt_start_layer or layer_id > config.adapt_end_layer
         if self.not_addition_layer:
@@ -45,10 +45,10 @@ class AdapterModule(nn.Module):
         mean, stddev = self.rd_loss_record.mean, self.rd_loss_record.stddev
         if not self.rd_loss_record.length > 2:
             return torch.zeros_like(rd_loss).to(device)
-        z_score = (rd_loss-mean)/stddev
+        z_score = (rd_loss - mean) / stddev
         z_score = torch.abs(z_score)
         return z_score
-    
+
     def add_z_score_record(self, rd_loss):
         self.rd_loss_record.add_record(rd_loss.detach().cpu())
 
@@ -72,14 +72,14 @@ class SEMAModules(nn.Module):
         self.router = nn.Linear(config.d_model, 1).cuda()
         self.new_router = None
         self.detecting_outlier = False
-        
+
     @property
     def num_adapters(self):
         return len(self.adapters)
 
     def set_new_router(self):
         self.new_router = nn.Linear(self.config.d_model, 1).cuda()
-       
+
     def fix_router(self):
         trained_router = nn.Linear(self.config.d_model, len(self.adapters)).cuda()
         old_router = self.router
@@ -93,7 +93,6 @@ class SEMAModules(nn.Module):
         trained_router.bias = nn.Parameter(bias)
         self.router = trained_router
         self.new_router = None
-        
 
     def add_adapter(self, initialize=False):
         adapter_id = f"{self.layer_id}.{len(self.adapters)}"
@@ -111,22 +110,21 @@ class SEMAModules(nn.Module):
         added = False
         not_addition_layer = self.layer_id < self.adapt_start_layer or self.layer_id > self.adapt_end_layer
         if not_addition_layer:
-            func_out, _, _= self.adapters[-1](x)
+            func_out, _, _ = self.adapters[-1](x)
         else:
             func_outs, rd_losses, z_scores = [], [], []
             for adapter in self.adapters:
                 func_out, rd_loss, z_score = adapter(x)
-                func_outs.append(func_out)  
-                rd_losses.append(rd_loss)   
+                func_outs.append(func_out)
+                rd_losses.append(rd_loss)
                 z_scores.append(z_score)
 
             func_outs = torch.stack(func_outs)
             rd_losses = torch.stack(rd_losses)
             z_scores = torch.stack(z_scores)
-            
+
             addition_criteria = z_scores.mean(dim=1).min() > self.config.exp_threshold \
-                and self.layer_id >= self.adapt_start_layer \
-                and self.layer_id <= self.adapt_end_layer \
+                and self.adapt_start_layer <= self.layer_id <= self.adapt_end_layer \
                 and not self.added_for_task and self.detecting_outlier
 
             if addition_criteria:
@@ -138,8 +136,8 @@ class SEMAModules(nn.Module):
                 if self.new_router is not None:
                     new_logits = self.new_router(x.mean(dim=1))
                     logits = torch.cat([logits, new_logits], dim=1)
-                mask = torch.softmax(logits, dim=1) 
-                func_out = (func_outs * mask.transpose(0,1).unsqueeze(-1).unsqueeze(-1)).sum(dim=0)
+                mask = torch.softmax(logits, dim=1)
+                func_out = (func_outs * mask.transpose(0, 1).unsqueeze(-1).unsqueeze(-1)).sum(dim=0)
                 if self.adapters[-1].newly_added:
                     rd_loss = rd_losses[-1].mean()
                 else:
@@ -153,7 +151,6 @@ class SEMAModules(nn.Module):
         self.freeze_rd()
         self.reset_newly_added_status()
         self.added_for_task = False
-    
 
     def reset_newly_added_status(self):
         self.newly_added = False

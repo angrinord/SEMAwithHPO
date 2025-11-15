@@ -3,6 +3,7 @@ from torch import nn
 from torch.nn import functional as F
 import math
 
+
 class Adapter(nn.Module):
     def __init__(self,
                  config=None,
@@ -51,43 +52,57 @@ class Adapter(nn.Module):
         down = self.non_linear_func(down)
         output = self.up_proj(down)
         return output
-    
+
+    def rebuild_adapter(self, new_rank):
+        device = next(self.parameters()).device
+        if new_rank == self.down_size:
+            print(f"[Adapter] Rank already {new_rank}, skipping rebuild.")
+            return
+
+        print(f"[Adapter] Rebuilding adapter {self.adapter_id} with new rank={new_rank}")
+        self.down_size = new_rank
+        self.down_proj = nn.Linear(self.n_embd, new_rank).to(device)
+        self.up_proj = nn.Linear(new_rank, self.n_embd).to(device)
+        nn.init.kaiming_uniform_(self.down_proj.weight, a=math.sqrt(5))
+        nn.init.zeros_(self.up_proj.weight)
+        nn.init.zeros_(self.down_proj.bias)
+        nn.init.zeros_(self.up_proj.bias)
+
 
 class AE(nn.Module):
-	def __init__(self, config):
-		super(AE, self).__init__()
-		self.input_dim = config.d_model
-		self.config = config
-		self.encoder = nn.Linear(self.input_dim, config.rd_dim)
-		self.decoder = nn.Linear(config.rd_dim, self.input_dim)
-		self.weight_initialize()
+    def __init__(self, config):
+        super(AE, self).__init__()
+        self.input_dim = config.d_model
+        self.config = config
+        self.encoder = nn.Linear(self.input_dim, config.rd_dim)
+        self.decoder = nn.Linear(config.rd_dim, self.input_dim)
+        self.weight_initialize()
 
-	def forward(self, x):
-		encoded = self.encoder(x)
-		reconstruction = self.decoder(encoded)
-		return reconstruction
-	
-	def compute_reconstruction_loss(self, x):
-		x = x.mean(dim=1)
-		reconstruction = self.forward(x)
-		reconstruction_losses = []
-		B = x.shape[0]
-		for i in range(B):
-			reconstruction_losses.append(self.reconstruction_loss(reconstruction[i], x[i]))
-		reconstruction_losses = torch.stack(reconstruction_losses)
-		return reconstruction_losses
+    def forward(self, x):
+        encoded = self.encoder(x)
+        reconstruction = self.decoder(encoded)
+        return reconstruction
 
-	def reconstruction_loss(self, reconstruction, x):
-		reconstruction_loss = F.mse_loss(reconstruction, x)
-		return reconstruction_loss
+    def compute_reconstruction_loss(self, x):
+        x = x.mean(dim=1)
+        reconstruction = self.forward(x)
+        reconstruction_losses = []
+        B = x.shape[0]
+        for i in range(B):
+            reconstruction_losses.append(self.reconstruction_loss(reconstruction[i], x[i]))
+        reconstruction_losses = torch.stack(reconstruction_losses)
+        return reconstruction_losses
 
-	def weight_initialize(self):
-		with torch.no_grad():
-			nn.init.kaiming_uniform_(self.encoder.weight, a=math.sqrt(5))
-			nn.init.zeros_(self.encoder.bias)
-			nn.init.kaiming_uniform_(self.decoder.weight, a=math.sqrt(5))
-			nn.init.zeros_(self.decoder.bias)
+    def reconstruction_loss(self, reconstruction, x):
+        reconstruction_loss = F.mse_loss(reconstruction, x)
+        return reconstruction_loss
 
+    def weight_initialize(self):
+        with torch.no_grad():
+            nn.init.kaiming_uniform_(self.encoder.weight, a=math.sqrt(5))
+            nn.init.zeros_(self.encoder.bias)
+            nn.init.kaiming_uniform_(self.decoder.weight, a=math.sqrt(5))
+            nn.init.zeros_(self.decoder.bias)
 
 
 class Records:
@@ -107,7 +122,7 @@ class Records:
     @property
     def mean(self):
         return self._mean
-    
+
     @property
     def stddev(self):
         return math.sqrt(self._var)
@@ -118,12 +133,12 @@ class Records:
         if self._curr_len < self._max_len:
             place_left = self._max_len - self._curr_len
             if place_left > len(v):
-                self.record[self._curr_len:self._curr_len+len(v)] = v
-                self._curr_len += len(v)    
+                self.record[self._curr_len:self._curr_len + len(v)] = v
+                self._curr_len += len(v)
             else:
                 self.record[self._curr_len:] = v[:place_left]
-                self._curr_len = self._max_len   
-        else:           
+                self._curr_len = self._max_len
+        else:
             self.record = torch.cat([self.record, v])
             self.record = self.record[len(v):]
         self._mean = torch.mean(self.record[:self._curr_len])

@@ -2,18 +2,21 @@ import logging
 import numpy as np
 import torch
 from torch import nn
-from torch.serialization import load
 from tqdm import tqdm
 import math
 from torch import optim
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
+
+from backbone.sema_components import Adapter
+from hpo_utils_smac import hpo4adapter
 from utils.inc_net import SEMAVitNet
 from models.base import BaseLearner
 from utils.toolkit import tensor2numpy
 from backbone.sema_block import SEMAModules
 
 num_workers = 8
+
 
 class Learner(BaseLearner):
     def __init__(self, args):
@@ -39,14 +42,14 @@ class Learner(BaseLearner):
         logging.info("Learning on {}-{}".format(self._known_classes, self._total_classes))
 
         train_dataset = data_manager.get_dataset(np.arange(self._known_classes, self._total_classes),source="train", mode="train", )
-        self.train_dataset=train_dataset
-        self.data_manager=data_manager
+        self.train_dataset = train_dataset
+        self.data_manager = data_manager
         self.train_loader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=num_workers)
 
         test_dataset = data_manager.get_dataset(np.arange(0, self._total_classes), source="test", mode="test" )
         self.test_loader = DataLoader(test_dataset, batch_size=self.batch_size, shuffle=False, num_workers=num_workers)
 
-        train_dataset_for_protonet=data_manager.get_dataset(np.arange(self._known_classes, self._total_classes),source="train", mode="test", )
+        train_dataset_for_protonet = data_manager.get_dataset(np.arange(self._known_classes, self._total_classes),source="train", mode="test", )
         self.train_loader_for_protonet = DataLoader(train_dataset_for_protonet, batch_size=self.batch_size, shuffle=True, num_workers=num_workers)
 
         if len(self._multiple_gpus) > 1:
@@ -56,10 +59,10 @@ class Learner(BaseLearner):
         if len(self._multiple_gpus) > 1:
             self._network = self._network.module
 
-    def _train(self, train_loader, test_loader):
-        
+    def _train(self, train_loader, test_loader, hpo=False):
+
         self._network.to(self._device)
-        
+
         if self._cur_task == 0:
             # show total parameters and trainable parameters
             total_params = sum(p.numel() for p in self._network.parameters())
@@ -67,12 +70,46 @@ class Learner(BaseLearner):
             total_trainable_params = sum(
                 p.numel() for p in self._network.parameters() if p.requires_grad)
             print(f'{total_trainable_params:,} training parameters.')
+
+            if hpo:
+                print(f"[SEMA-HPO] Starting HPO for initial task (task {self._cur_task})...")
+                hpo_dataset = self.data_manager.get_dataset(
+                    np.arange(self._known_classes, self._total_classes),
+                    source="train",
+                    mode="train"
+                )
+                best_cfg = hpo4adapter(
+                    self._network,
+                    dataset=hpo_dataset,
+                    device=self._device
+                )
+                print(f"[SEMA-HPO] Best adapter hyperparameters for initial task: {best_cfg}")
+
+                # apply configuration
+                for module in self._network.backbone.modules():
+                    if isinstance(module, Adapter):
+                        if "rank" in best_cfg:
+                            module.rebuild_adapter(best_cfg["rank"])
+                        if "dropout" in best_cfg:
+                            module.dropout = float(best_cfg["dropout"])
+                        if "activation" in best_cfg:
+                            act_name = best_cfg["activation"].capitalize()
+                            if hasattr(torch.nn, act_name):
+                                module.non_linear_func = getattr(torch.nn, act_name)()
+                        if "alpha" in best_cfg:
+                            module.scale = float(best_cfg["alpha"])
+                        with torch.no_grad():
+                            nn.init.zeros_(module.up_proj.weight)
+                    module.to(self._device)
+                print(f"[SEMA-HPO] Applied initial adapter config: {best_cfg}")
+
             self._train_new(train_loader, test_loader)
         else:
+            # Existing logic for later tasks
             for module in self._network.backbone.modules():
                 if isinstance(module, SEMAModules):
                     module.detecting_outlier = True
-            detect_loader = DataLoader(train_loader.dataset, batch_size=self.args["detect_batch_size"], shuffle=True, num_workers=num_workers)     
+            detect_loader = DataLoader(train_loader.dataset, batch_size=self.args["detect_batch_size"], shuffle=True, num_workers=num_workers)
             added = self._detect_outlier(detect_loader, train_loader, test_loader, 0)
 
             for module in self._network.backbone.modules():
@@ -81,7 +118,7 @@ class Learner(BaseLearner):
             if added == 0:
                 self.update_optimizer_and_scheduler(num_epoch=self.args['func_epoch'], lr=self.init_lr)
                 self._init_train(self.args['func_epoch'], train_loader, test_loader, self.optimizer, self.scheduler, phase='func')
-            
+
         for module in self._network.backbone.modules():
             if isinstance(module, SEMAModules):
                 module.end_of_task_training()
@@ -92,7 +129,7 @@ class Learner(BaseLearner):
         self.update_rd_optimizer_and_scheduler(num_epoch=self.args['rd_epoch'], lr=self.args['rd_lr'])
         self._init_train(self.args['rd_epoch'], train_loader, test_loader, self.rd_optimizer, self.rd_scheduler, phase='rd')
 
-    def _detect_outlier(self, detect_loader, train_loader, test_loader, added):
+    def _detect_outlier(self, detect_loader, train_loader, test_loader, added, hpo=False):
         is_added = False
         for i, (_, inputs, targets) in enumerate(detect_loader):
             inputs, targets = inputs.to(self._device), targets.to(self._device)
@@ -105,16 +142,45 @@ class Learner(BaseLearner):
                 for module in self._network.backbone.modules():
                     if isinstance(module, SEMAModules):
                         module.detecting_outlier = False
+                if hpo:
+                    print(f"[SEMA-HPO] Detected new adapter at task {self._cur_task}, starting HPO...")
+                    hpo_dataset = self.data_manager.get_dataset(
+                        np.arange(self._known_classes, self._total_classes),
+                        source="train",
+                        mode="train"
+                    )
+                    best_cfg = hpo4adapter(
+                        self._network,
+                        dataset=hpo_dataset,
+                        device=self._device
+                    )
+                    print(f"[SEMA-HPO] Best adapter hyperparameters: {best_cfg}")
+
+                    for module in self._network.backbone.modules():
+                        if isinstance(module, Adapter) and getattr(module, "is_new", False):
+                            if "rank" in best_cfg:
+                                module.rebuild_adapter(best_cfg["rank"])
+                            if "dropout" in best_cfg:
+                                module.dropout = float(best_cfg["dropout"])
+                            if "activation" in best_cfg:
+                                act_name = best_cfg["activation"].capitalize()
+                                if hasattr(torch.nn, act_name):
+                                    module.non_linear_func = getattr(torch.nn, act_name)()
+                            if "alpha" in best_cfg:
+                                module.scale = float(best_cfg["alpha"])
+                            with torch.no_grad():
+                                nn.init.zeros_(module.up_proj.weight)
+
+                    print(f"[SEMA-HPO] Applied best adapter config: {best_cfg}")
+                # retrain
                 self._train_new(train_loader, test_loader)
                 for module in self._network.backbone.modules():
                     if isinstance(module, SEMAModules):
                         module.detecting_outlier = True
-                for module in self._network.backbone.modules():
-                    if isinstance(module, SEMAModules):
                         module.freeze_functional()
                         module.freeze_rd()
                         module.reset_newly_added_status()
-        
+
         if is_added:
             return self._detect_outlier(detect_loader, train_loader, test_loader, added)
         else:
@@ -200,7 +266,6 @@ class Learner(BaseLearner):
             total += len(targets)
 
         return np.around(tensor2numpy(correct) * 100 / total, decimals=2)
-
 
     def update_optimizer_and_scheduler(self, num_epoch=20, lr=None):
         lr = self.args["init_lr"] if lr is None else lr

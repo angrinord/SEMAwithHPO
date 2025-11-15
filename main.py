@@ -7,6 +7,7 @@ from datetime import datetime
 from trainer import train
 from eval import eval
 
+
 def main():
     args = setup_parser().parse_args()
     param = load_json(args.config)
@@ -17,10 +18,12 @@ def main():
     else:
         eval(args)
 
+
 def load_json(setting_path):
     with open(setting_path) as data_file:
         param = json.load(data_file)
     return param
+
 
 def setup_parser():
     parser = argparse.ArgumentParser(description='Reproduce of multiple pre-trained incremental learning algorthms.')
@@ -28,6 +31,7 @@ def setup_parser():
                         help='Json file of settings.')
     parser.add_argument('--eval', type=bool, default=False)
     return parser
+
 
 if __name__ == '__main__':
     main()
