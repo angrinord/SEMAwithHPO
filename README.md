@@ -1,3 +1,5 @@
+This fork is [SEMA-CL](https://github.com/huiyiwang01/SEMA-CL) with hyperparameter optimization.
+
 # Self-Expansion of Pre-trained Models with Mixture of Adapters for Continual Learning
 
 
