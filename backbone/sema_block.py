@@ -9,10 +9,13 @@ device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 
 class AdapterModule(nn.Module):    
-    def __init__(self, config, adapter_id, writer):
+    def __init__(self, config, adapter_id, writer, bottleneck=None):
         super().__init__()
         self.config = config
-        self.functional = Adapter(self.config, adapter_id, dropout=0.1, bottleneck=self.config.ffn_num,
+        # I added the bottleneck term to the method signature and pass it along to Adapter here.
+        if bottleneck is None:
+            bottleneck = self.config.ffn_num
+        self.functional = Adapter(self.config, adapter_id, dropout=0.1, bottleneck=bottleneck,
                                 init_option=self.config.ffn_adapter_init_option,
                                 adapter_scalar=self.config.ffn_adapter_scalar,
                                 adapter_layernorm_option=self.config.ffn_adapter_layernorm_option,
@@ -52,6 +55,17 @@ class AdapterModule(nn.Module):
     def add_z_score_record(self, rd_loss):
         self.rd_loss_record.add_record(rd_loss.detach().cpu())
 
+    def reinitialize_bottleneck(self, new_bottleneck: int):
+        self.functional = Adapter(
+            self.config,
+            self.adapter_id,
+            dropout=0.1,
+            bottleneck=new_bottleneck,
+            init_option=self.config.ffn_adapter_init_option,
+            adapter_scalar=self.config.ffn_adapter_scalar,
+            adapter_layernorm_option=self.config.ffn_adapter_layernorm_option,
+        ).to(device)
+
 
 class SEMAModules(nn.Module):
     def __init__(self, config, layer_id, writer):
@@ -63,6 +77,7 @@ class SEMAModules(nn.Module):
         self.writer = writer
         self.newly_added = True
         self.added_for_task = True
+        self.next_adapter_bottleneck = self.config.ffn_num
         self.adapt_start_layer = config.adapt_start_layer
         self.adapt_end_layer = config.adapt_end_layer
         # initialize with one adapter
@@ -93,11 +108,17 @@ class SEMAModules(nn.Module):
         trained_router.bias = nn.Parameter(bias)
         self.router = trained_router
         self.new_router = None
-        
 
     def add_adapter(self, initialize=False):
+        # Right here HPO should be performed.  In order to do so, the necessary info needs to be stored in sema_block.
+        # This info needs to be passed from sema to sema_block somehow.  I think sema can directly manipulate its instance called 'module' in _train to do this.
         adapter_id = f"{self.layer_id}.{len(self.adapters)}"
-        new_adapter = AdapterModule(self.config, adapter_id, self.writer).to(device)
+        new_adapter = AdapterModule(
+            self.config,
+            adapter_id,
+            self.writer,
+            bottleneck=self.next_adapter_bottleneck
+        ).to(device)
         self.newly_added = True
         self.added_for_task = True
         self.adapters.append(new_adapter)
@@ -153,7 +174,6 @@ class SEMAModules(nn.Module):
         self.freeze_rd()
         self.reset_newly_added_status()
         self.added_for_task = False
-    
 
     def reset_newly_added_status(self):
         self.newly_added = False
@@ -180,3 +200,10 @@ class SEMAModules(nn.Module):
                     param.requires_grad = False
                     param._grad = None
                 adapter.rd_loss_record.updating = False
+
+    def set_next_bottleneck(self, ffn_num: int):
+        self.next_adapter_bottleneck = int(ffn_num)
+
+    def reinitialize_latest_adapter(self, ffn_num: int):
+        latest = self.adapters[-1]
+        latest.reinitialize_bottleneck(ffn_num)
